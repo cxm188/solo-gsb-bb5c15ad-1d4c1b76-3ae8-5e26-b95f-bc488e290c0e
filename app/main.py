@@ -7,6 +7,9 @@
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
 * POST /audit-lock  只审计不求解：按 current_lock 的锁定版本从根包遍历
   已激活依赖，报告 missing/unavailable/constraint_mismatch/extraneous
+* POST /dependency-paths  先按 /audit-lock 规则审计 current_lock（无效返回
+  409 并携带审计问题，不执行路径查询）；有效时按锁定版本与目标环境激活的
+  依赖建图，返回根包到目标包的全部最短包路径（菱形等长路径保留，环安全）
 * GET  /healthz     健康检查
 """
 
@@ -17,6 +20,7 @@ from fastapi.responses import JSONResponse
 from packaging.version import Version
 
 from .audit import audit_lock
+from .paths import dependency_paths
 from .repository import (
     SnapshotError,
     build_repository,
@@ -28,6 +32,9 @@ from .resolver import ResolutionLimit, Resolver
 from .schemas import (
     AuditLockRequest,
     AuditLockResponse,
+    DependencyPathsRequest,
+    DependencyPathsResponse,
+    InvalidLockResponse,
     InvalidSnapshotResponse,
     ResolveRequest,
     ResolveResponse,
@@ -43,7 +50,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -271,3 +278,72 @@ def audit_lock_endpoint(request: AuditLockRequest):
         allow_prereleases=request.allow_prereleases,
     )
     return {"status": "ok", **result}
+
+
+@app.post(
+    "/dependency-paths",
+    summary="解释目标包为何出现在锁定清单中（最短依赖路径）",
+    response_model=DependencyPathsResponse,
+    responses={
+        409: {
+            "model": InvalidLockResponse,
+            "description": "锁定清单未通过审计，不执行路径查询",
+        },
+        422: {
+            "model": InvalidSnapshotResponse,
+            "description": "快照、current_lock 或请求非法",
+        },
+    },
+)
+def dependency_paths_endpoint(request: DependencyPathsRequest):
+    root_canonical = canonical(request.root)
+    target_canonical = canonical(request.target)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    audit = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    if audit["issues"]:
+        # 锁定清单无效：返回确定性排序的审计问题，不执行路径查询。
+        return JSONResponse(
+            status_code=409,
+            content={"status": "invalid_lock", **audit},
+        )
+
+    result = dependency_paths(
+        repo,
+        root_name=root_canonical,
+        current_lock=current_lock,
+        target_name=target_canonical,
+    )
+    return {
+        "status": "ok",
+        "valid": True,
+        "root": root_canonical,
+        "target": target_canonical,
+        **result,
+    }

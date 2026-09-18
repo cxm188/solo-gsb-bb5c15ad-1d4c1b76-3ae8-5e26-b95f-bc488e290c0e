@@ -8,6 +8,8 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 整体解析的最高版本，并最小化其余包相对当前锁的变更数量。
 `/audit-lock` 对现有锁定清单做**只审计、不重新求解**的自洽性检查：按锁定
 版本从根包遍历已激活依赖，报告缺失、版本不可用、约束不满足与多余的包。
+`/dependency-paths` 在审计通过的前提下解释**目标包为何出现在锁定清单中**：
+按锁定版本与目标环境激活的依赖建图，返回根包到目标包的全部最短依赖路径。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -38,6 +40,7 @@ docker compose up --build
 | 解析接口 | `POST http://localhost:8000/resolve` |
 | 升级接口 | `POST http://localhost:8000/upgrade` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
+| 路径解释接口 | `POST http://localhost:8000/dependency-paths` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -460,6 +463,76 @@ curl -s -X POST http://localhost:8000/audit-lock \
 | `200` | 审计完成（`valid` 为 `true` 或 `false` 都是 200；审计不产生 409） |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
 
+### `POST /dependency-paths`
+
+解释**目标包为什么出现在锁定清单中**。请求体包含 `/audit-lock` 的全部字段
+（`repository` / `root` / `target_environment` / `specifier` /
+`allow_prereleases` / `current_lock`，语义完全一致），并附加 `target`：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `target` | `string` | 是 | 要解释的目标包名（PEP 503 规范化匹配）；**不要求**出现在 `current_lock` 中 |
+
+工作流程：
+
+1. **先审计**：按 `/audit-lock` 的同一套规则校验 `current_lock`。只要存在
+   任何问题（missing / unavailable / constraint_mismatch / extraneous），
+   返回 **409** 与确定性排序的 `issues`（与 `/audit-lock` 的输出一致），
+   **不执行路径查询**；
+2. **再建图**：锁定清单有效时，以锁中包为节点、锁定版本在目标环境下
+   **已激活**的依赖为边（marker 语义与 `/resolve` 一致），从根包做 BFS；
+3. **返回全部最短路径**：菱形依赖的等长路径全部保留；依赖环中每个节点
+   只按最短深度记录一次，路径上不会重复节点、不会无限遍历；路径按节点
+   序列字典序排序，与包键 / 候选列表的输入顺序无关。
+
+```bash
+curl -s -X POST http://localhost:8000/dependency-paths \
+  -H 'Content-Type: application/json' \
+  -d @examples/dependency-paths.json
+```
+
+示例中 `shared-util` 被 `web-framework` 与 `auth-lib` 同时依赖（菱形），
+两条等长最短路径都返回（`win-only` 仅在 `win32` 下激活，linux 请求下
+不在图中）：
+
+```json
+{
+  "status": "ok",
+  "valid": true,
+  "root": "app",
+  "target": "shared-util",
+  "reachable": true,
+  "paths": [
+    ["app", "auth-lib", "shared-util"],
+    ["app", "web-framework", "shared-util"]
+  ]
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `valid` | 锁定清单已通过审计（恒为 `true`；无效时返回 409） |
+| `root` / `target` | 规范化后的根包名 / 目标包名（PEP 503） |
+| `reachable` | 目标是否能从根包按锁定版本的已激活依赖到达 |
+| `paths` | 全部最短包路径（节点为规范化包名，按节点序列字典序排序）；目标为根包时是单节点路径，如 `[["app"]]`；`reachable=false` 时为空列表 |
+
+边界情况：
+
+- `target` 与根包相同：返回单节点路径（`"paths": [["app"]]`）；
+- `target` 不在 `current_lock` 中（或不可达）：`"reachable": false` 且
+  `"paths": []`——这不是错误，有效锁中本就不该出现无关的包；
+- 仅被未激活 marker 依赖要求的包不在图中（与审计的 extraneous 判定一致）。
+
+`/dependency-paths` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 锁定清单有效，返回最短路径（`reachable=false` 表示目标不在锁中 / 不可达） |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，携带与 `/audit-lock` 相同的确定性排序 `issues`，不执行路径查询 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 非法、`target` 缺失 / 非法 |
+
 ---
 
 ## 三、解析规则说明
@@ -488,6 +561,10 @@ curl -s -X POST http://localhost:8000/audit-lock \
     遍历已激活依赖：环中包只展开一次但累计全部入边约束；输出
     missing / unavailable / constraint_mismatch / extraneous 四类确定性
     排序的问题，包名按 PEP 503、版本与约束按 PEP 440 判断。
+11. **路径解释（`/dependency-paths`）**：先按第 10 条规则审计
+    `current_lock`，无效即返回 409（携带审计问题，不查询路径）；有效时
+    以锁中包为节点、锁定版本的已激活依赖为边做 BFS，返回根包到目标包的
+    全部最短路径——菱形等长路径保留，环上节点不重复，路径按字典序排序。
 
 ### 安全护栏
 
@@ -502,10 +579,11 @@ app/
   main.py        # FastAPI 路由与错误映射
   resolver.py    # 回溯求解器（候选排序 / MRV / 来源链重建）
   audit.py       # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
+  paths.py       # 依赖路径解释（有效锁上 BFS 全部最短路径 / 菱形保留 / 环安全）
   repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker、/upgrade、/audit-lock 示例）
+examples/        # curl 示例请求体（含跨环境 marker、/upgrade、/audit-lock、/dependency-paths 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

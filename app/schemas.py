@@ -145,6 +145,23 @@ class AuditLockRequest(ResolveRequest):
     )
 
 
+class DependencyPathsRequest(AuditLockRequest):
+    """POST /dependency-paths 的请求体：在锁定审计字段上附加目标包。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；仅当锁有效时才按
+    锁定版本建图，查询从根包到 target 的所有最短包路径。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    target: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="要解释的目标包名（PEP 503 规范化匹配）；不可达时返回 reachable=false。",
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -321,6 +338,49 @@ class AuditLockResponse(BaseModel):
         ...,
         description=(
             "审计问题，确定性排序：先按类型"
+            "（missing、unavailable、constraint_mismatch、extraneous），"
+            "再按规范化包名。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /dependency-paths 响应
+# --------------------------------------------------------------------- #
+class DependencyPathsResponse(BaseModel):
+    """锁有效时的路径查询结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    target: str = Field(..., description="规范化目标包名。")
+    reachable: bool = Field(
+        ...,
+        description=(
+            "目标是否出现在锁定清单并从根包可达；为 false 时 paths 恒为空。"
+        ),
+    )
+    paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "根包到目标包的所有最短包路径（每条为规范化包名序列，含首尾）；"
+            "菱形依赖的等长路径全部保留；路径整体按字典序确定性排序。"
+        ),
+    )
+
+
+class InvalidLockResponse(BaseModel):
+    """锁定清单未通过审计：409，不执行路径查询。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_lock"]
+    message: str
+    issues: list[AuditIssueOut] = Field(
+        ...,
+        description=(
+            "与 /audit-lock 完全一致的审计问题，确定性排序：先按类型"
             "（missing、unavailable、constraint_mismatch、extraneous），"
             "再按规范化包名。"
         ),
